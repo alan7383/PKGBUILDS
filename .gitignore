@@ -1,0 +1,11 @@
+# makepkg build leftovers and downloaded/built artifacts
+*.tar.zst
+*.tar.gz
+*.tar.bz2
+*.pkg.tar.*
+*/src/
+*/pkg/
+*.deb
+*.zip
+*.AppImage
+*.flatpak

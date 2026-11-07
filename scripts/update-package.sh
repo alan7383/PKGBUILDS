@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# Update one package directory:
+#   1. determine the latest upstream version (pkg.sh: latest_version)
+#   2. on a new upstream version: set pkgver and let pkg.sh's
+#      refresh_checksums update the sums
+#   3. if the PKGBUILD changed: set pkgrel and run a makepkg test build
+#   4. regenerate .SRCINFO and commit changes back to this repository
+#   5. push the package files to the AUR if it differs, unless the package
+#      opts out with AUR_PUBLISH=false
+#
+# Every package sources deliverables published by upstream - the AUR does not
+# allow a PKGBUILD to pull in a binary tarball built by the maintainer, so
+# nothing is ever built or hosted here.
+#
+# Requires: GH_TOKEN (repo push), AUR_SSH_PRIVATE_KEY.
+# Optional: AUR_GIT_NAME / AUR_GIT_EMAIL for the AUR commit identity.
+set -euo pipefail
+
+pkg="${1:?usage: update-package.sh <package-dir>}"
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$repo_root"
+pkg="${pkg%/}"
+
+# In the CI container the checkout is owned by a different uid than root;
+# git (also invoked internally by gh) refuses to touch it without this.
+if [[ "${CI:-}" == "true" ]]; then
+  git config --global --add safe.directory "$repo_root"
+fi
+
+BUILD_DEPS=()
+# A package can be kept out of the AUR while it is still being prepared here:
+# pkg.sh sets AUR_PUBLISH=false and everything up to step 4 runs as usual, so
+# the PKGBUILD stays current and test-built - only the publishing waits.
+AUR_PUBLISH=true
+source "$pkg/pkg.sh"
+
+oldver="$(grep -Po '^pkgver=\K.*' "$pkg/PKGBUILD")"
+oldrel="$(grep -Po '^pkgrel=\K.*' "$pkg/PKGBUILD")"
+
+rc=0
+ver="$(latest_version)" || rc=$?
+if [[ "$rc" -eq 75 ]]; then
+  echo "::warning::$pkg: upstream has no current release to track right now -" \
+       "leaving the version alone, the next run tries again."
+  ver="$oldver"
+fi
+if [[ -z "$ver" || "$ver" == "null" ]]; then
+  echo "::error::$pkg: could not determine the latest upstream version"
+  exit 1
+fi
+if [[ "$rc" -ne 75 ]]; then
+  echo "$pkg: latest upstream version is $ver"
+fi
+
+### 2: bring the PKGBUILD up to date ########################################
+
+if [[ "$ver" != "$oldver" ]]; then
+  sed -i "s|^pkgver=.*|pkgver=$ver|" "$pkg/PKGBUILD"
+  refresh_checksums "$ver" "$pkg/PKGBUILD"
+else
+  echo "$pkg: $ver is current"
+fi
+
+### 3: pkgrel + test build if the PKGBUILD changed ##########################
+
+# makepkg refuses to run as root (the CI container), so hand it to an
+# unprivileged user there.
+run_makepkg() {
+  if [[ "$EUID" -eq 0 ]]; then
+    useradd -m builder 2>/dev/null || true
+    chown -R builder "$pkg"
+    (cd "$pkg" && runuser -u builder -- makepkg "$@")
+  else
+    (cd "$pkg" && makepkg "$@")
+  fi
+}
+
+if git diff --quiet -- "$pkg/PKGBUILD"; then
+  rel="$oldrel"
+else
+  if [[ "$ver" != "$oldver" ]]; then
+    rel=1
+  else
+    rel=$((oldrel + 1))
+  fi
+  sed -i "s|^pkgrel=.*|pkgrel=$rel|" "$pkg/PKGBUILD"
+
+  # source packages need their makedepends to get through build()
+  if [[ "${CI:-}" == "true" && "${#BUILD_DEPS[@]}" -gt 0 ]]; then
+    pacman -S --noconfirm --needed "${BUILD_DEPS[@]}"
+  fi
+
+  # -d: the runner only needs to package, not run the result
+  run_makepkg -fdc
+  echo "$pkg: makepkg test build succeeded"
+fi
+
+# .SRCINFO regeneration is cheap - do it every run so it can never go stale
+run_makepkg --printsrcinfo > "$pkg/.SRCINFO.new"
+mv "$pkg/.SRCINFO.new" "$pkg/.SRCINFO"
+[[ "$EUID" -eq 0 ]] && chown -R 0:0 "$pkg"
+
+# drop downloaded sources and build leftovers (all gitignored, never tracked)
+rm -rf "$pkg/src" "$pkg/pkg"
+rm -f "$pkg"/*.pkg.tar.* "$pkg"/*.tar.zst "$pkg"/*.tar.gz "$pkg"/*.tar.bz2 \
+      "$pkg"/*.deb "$pkg"/*.AppImage "$pkg"/*.flatpak "$pkg"/*.zip
+
+### 4: commit back to this repository ########################################
+
+committed=false
+
+if [[ "${CI:-}" == "true" ]]; then
+  git config user.name "github-actions[bot]"
+  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+  git add "$pkg/PKGBUILD" "$pkg/.SRCINFO"
+  if git diff --cached --quiet; then
+    echo "$pkg: no changes to commit"
+  else
+    git commit -m "$pkg: update to $ver-$rel [skip ci]"
+    git pull --rebase origin "${GITHUB_REF_NAME:-main}"
+    git push origin "HEAD:${GITHUB_REF_NAME:-main}"
+    committed=true
+  fi
+fi
+
+### 5: push to the AUR #######################################################
+
+if [[ "$AUR_PUBLISH" != true ]]; then
+  echo "$pkg: AUR_PUBLISH is off - kept up to date here, not published to the AUR"
+  exit 0
+fi
+
+if [[ -z "${AUR_SSH_PRIVATE_KEY:-}" ]]; then
+  echo "::error::$pkg: AUR_SSH_PRIVATE_KEY is not set - cannot push to the AUR." \
+       "Add your AUR SSH private key as a repository secret named AUR_SSH_PRIVATE_KEY."
+  exit 1
+fi
+
+# Pass the key and known_hosts explicitly instead of via ~/.ssh: in the CI
+# container $HOME and the passwd home directory disagree, and ssh resolves
+# "~" through the latter, silently ignoring anything written to $HOME/.ssh.
+sshdir="$(mktemp -d)"
+printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$sshdir/key"
+chmod 600 "$sshdir/key"
+# Pinned host key, see https://aur.archlinux.org
+echo 'aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN' \
+  > "$sshdir/known_hosts"
+export GIT_SSH_COMMAND="ssh -i $sshdir/key -o UserKnownHostsFile=$sshdir/known_hosts -o IdentitiesOnly=yes"
+
+aurdir="$(mktemp -d)"
+
+if ! clone_log="$(git clone "ssh://aur@aur.archlinux.org/$pkg.git" "$aurdir" 2>&1)"; then
+  printf '%s\n' "$clone_log" >&2
+  if [[ "$committed" == false ]] &&
+     grep -qEi 'down due to maintenance|Connection (timed out|refused|closed)|Could not resolve hostname|kex_exchange|Broken pipe|Operation timed out' \
+       <<< "$clone_log"; then
+    echo "::warning::$pkg: the AUR is unreachable and this run has nothing to push -" \
+         "skipping the AUR sync, the next run picks it up."
+    exit 0
+  fi
+  echo "::error::$pkg: could not clone the AUR repository."
+  exit 1
+fi
+printf '%s\n' "$clone_log"
+
+# every tracked file of the package except our automation glue belongs on
+# the AUR (PKGBUILD, .SRCINFO, .desktop files, .install files, ...), and
+# nothing else: a file removed or renamed here goes from the AUR too
+find "$aurdir" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+while IFS= read -r f; do
+  [[ "$(basename "$f")" == "pkg.sh" ]] && continue
+  cp "$f" "$aurdir/"
+done < <(git ls-files "$pkg")
+
+cd "$aurdir"
+git config user.name "${AUR_GIT_NAME:-alan7383}"
+git config user.email "${AUR_GIT_EMAIL:-75907296+alan7383@users.noreply.github.com}"
+git add -A
+if git diff --cached --quiet && [[ -n "$(git ls-remote origin)" ]]; then
+  echo "$pkg: AUR package is already up to date"
+else
+  git commit -m "Update to $ver-$rel"
+  git push origin HEAD:master
+  echo "$pkg: pushed $ver-$rel to the AUR"
+fi
